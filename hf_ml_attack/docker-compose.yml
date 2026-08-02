@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+
+  manual_attacker:
+    build: ./manual_attacker
+    container_name: hf-attacker
+    networks:
+      hf-net:
+        ipv4_address: 172.20.0.10
+    tty: true
+    stdin_open: true
+
+  vulnerable_worker:
+    build: ./vulnerable_worker
+    container_name: hf-worker
+    networks:
+      hf-net:
+        ipv4_address: 172.20.0.20
+    ports:
+      - "8080:8080"   # dataset upload endpoint
+      - "5555:5555"   # web shell (spawned after malicious payload executes)
+    depends_on:
+      - internal_server
+
+  internal_server:
+    build: ./internal_server
+    container_name: hf-data-server
+    networks:
+      hf-net:
+        ipv4_address: 172.20.0.30
+
+networks:
+  hf-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

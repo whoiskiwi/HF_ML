@@ -1,0 +1,18 @@
+# API keys - never commit
+ai_attacker/.env
+
+# Generated SSH keys
+worker/worker_key
+worker/worker_key.pub
+data-server/worker_key.pub
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Experiment results (optional - remove this line if you want to track results)
+ai_attacker/results/
+
+# OS
+.DS_Store
