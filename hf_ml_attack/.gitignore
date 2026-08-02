@@ -1,10 +1,10 @@
 # API keys - never commit
-ai_attacker/.env
+agent/.env
 
-# Generated SSH keys
-worker/worker_key
-worker/worker_key.pub
-data-server/worker_key.pub
+# SSH keys
+vulnerable_worker/worker_key
+vulnerable_worker/worker_key.pub
+internal_server/worker_key.pub
 
 # Python cache
 __pycache__/
@@ -12,7 +12,11 @@ __pycache__/
 *.pyo
 
 # Experiment results (optional - remove this line if you want to track results)
-ai_attacker/results/
+agent/results/
 
 # OS
 .DS_Store
+
+# Diagram/report generators (optional)
+generate_diagram*.py
+generate_report.py
