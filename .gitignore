@@ -18,6 +18,6 @@ pipeline/output/vulns.json
 pipeline/output/environments/
 
 # Environment files
-pipeline/.env
+**/.env
 *.pyc
 __pycache__/
