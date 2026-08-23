@@ -1,0 +1,24 @@
+# 受害者容器 - 运行Transformers并加载受控模型
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    git \
+    openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装Transformers和依赖
+RUN pip install --no-cache-dir \
+    transformers \
+    torch \
+    numpy \
+    requests \
+    pydantic
+
+WORKDIR /opt
+
+# 创建目录
+RUN mkdir -p /root/.huggingface /root/.aws
+
+CMD ["/bin/bash"]

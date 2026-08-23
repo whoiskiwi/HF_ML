@@ -1,2 +1,23 @@
 # Claude Code plugin files
 .claude/
+
+# Chinese documentation (working notes, not source)
+plan.md
+standalone_report.md
+pipeline/LIMITATIONS.md
+pipeline/COMMANDS_GUIDE.md
+research_reports/
+hf_ml_attack/agent/plan.md
+
+# Generated pipeline output
+pipeline/output/raw_report.md
+pipeline/output/summary.md
+pipeline/output/FAILED_CASES.md
+pipeline/output/test_results.md
+pipeline/output/vulns.json
+pipeline/output/environments/
+
+# Environment files
+pipeline/.env
+*.pyc
+__pycache__/

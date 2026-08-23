@@ -1,0 +1,18 @@
+# 攻击者容器 - 托管恶意模型和kernel
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    openssh-server \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装HTTP服务器依赖
+RUN pip install --no-cache-dir \
+    flask \
+    requests
+
+WORKDIR /opt
+
+# 复制脚本在启动时会被挂载
+CMD ["/bin/bash"]

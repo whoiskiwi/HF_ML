@@ -1,0 +1,2 @@
+# 每分钟执行一次 load_model.py，模拟数据科学家定期拉取最新模型的工作习惯
+* * * * * /usr/local/bin/python3 /app/load_model.py >> /var/log/load_model.log 2>&1

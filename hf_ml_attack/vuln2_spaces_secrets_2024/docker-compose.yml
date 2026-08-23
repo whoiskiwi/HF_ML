@@ -1,0 +1,41 @@
+services:
+
+  # 攻击者容器：主动发请求读取 secrets，再用 token 访问私有仓库
+  attacker:
+    build: ./attacker
+    container_name: vuln2-attacker
+    networks:
+      vuln2-net:
+        ipv4_address: 172.22.0.10
+    tty: true
+    stdin_open: true
+    depends_on:
+      - spaces_server
+      - private_repo_server
+
+  # Spaces 服务器：模拟 HuggingFace Spaces，/secrets 接口未鉴权
+  spaces_server:
+    build: ./spaces_server
+    container_name: vuln2-spaces-server
+    networks:
+      vuln2-net:
+        ipv4_address: 172.22.0.20
+    ports:
+      - "8082:8080"  # 宿主机 8082 映射容器 8080，方便调试
+
+  # 私有仓库服务器：需要有效 HF Token 才能访问私有数据
+  private_repo_server:
+    build: ./private_repo_server
+    container_name: vuln2-private-repo
+    networks:
+      vuln2-net:
+        ipv4_address: 172.22.0.30
+    ports:
+      - "9091:9090"  # 宿主机 9091 映射容器 9090，方便调试
+
+networks:
+  vuln2-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.22.0.0/24  # 和 vuln1、vuln5 用不同子网，避免冲突

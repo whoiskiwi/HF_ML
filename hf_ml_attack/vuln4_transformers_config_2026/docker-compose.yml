@@ -1,0 +1,78 @@
+# Vuln4: CVE-2026-4372 - Transformers Config Injection RCE
+# 漏洞4：CVE-2026-4372 - Transformers 配置文件注入RCE
+#
+# 攻击链：
+# attacker (172.24.0.10) - HTTP服务器，托管恶意模型
+#   -> 提供恶意config.json，其中_attn_implementation_internal指向攻击者的kernel
+#   -> victim (172.24.0.30) 调用 AutoModelForCausalLM.from_pretrained()
+#   -> Transformers读取config.json，setattr()应用所有字段（包括_attn_implementation_internal）
+#   -> hub_kernels.py 识别owner/repo格式，下载并执行攻击者的kernel
+#   -> kernel/__init__.py 执行，获取受害者的凭证
+#   -> 读取 ~/.huggingface/token 和 ~/.aws/credentials
+
+version: '3.8'
+
+networks:
+  vuln4_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.24.0.0/24
+
+services:
+  # 攻击者容器 - 托管恶意模型和kernel
+  attacker:
+    container_name: vuln4_attacker
+    build:
+      context: .
+      dockerfile: Dockerfile.attacker
+    networks:
+      vuln4_network:
+        ipv4_address: 172.24.0.10
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      - MODEL_REPO_PORT=8080
+      - EXFIL_SERVER_PORT=9090
+    volumes:
+      - ./model_repo:/opt/model_repo
+      - ./scripts/model_server.py:/opt/model_server.py
+      - ./scripts/exfil_server.py:/opt/exfil_server.py
+    command: bash -c "python3 /opt/model_server.py & python3 /opt/exfil_server.py"
+
+  # 受害者容器 - 运行transformers模型加载脚本
+  victim:
+    container_name: vuln4_victim
+    build:
+      context: .
+      dockerfile: Dockerfile.victim
+    networks:
+      vuln4_network:
+        ipv4_address: 172.24.0.30
+    environment:
+      - MODEL_SERVER_URL=http://172.24.0.10:8080
+      - EXFIL_SERVER_URL=http://172.24.0.10:9090
+      - HF_TOKEN=hf_victim_token_secret_12345
+      - AWS_ACCESS_KEY_ID=AKIAVICTIMKEY123456
+      - AWS_SECRET_ACCESS_KEY=wJalrXUt/K7MDENG/bPxRfiCYVICTIMSECRETKEY
+    volumes:
+      - ./scripts/load_model.py:/opt/load_model.py
+      - ./data/huggingface_config:/root/.huggingface
+      - ./data/aws_config:/root/.aws
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+
+  # 可选：用于检测泄露凭证的日志服务器
+  logger:
+    container_name: vuln4_logger
+    image: nginx:latest
+    networks:
+      vuln4_network:
+        ipv4_address: 172.24.0.40
+    ports:
+      - "8888:80"
+    volumes:
+      - ./logs:/usr/share/nginx/html
+    command: nginx -g "daemon off;"
