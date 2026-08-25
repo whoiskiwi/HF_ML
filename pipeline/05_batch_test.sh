@@ -67,7 +67,7 @@ for c in m.get('containers', []):
     echo "  → Running exploit..."
     exploit_out=$(docker exec "$attacker_name" python3 /attack/exploit.py 2>&1)
 
-    if echo "$exploit_out" | grep -qi "hf_fake\|akiafake\|credentials\|success\|secret"; then
+    if echo "$exploit_out" | grep -qi "hf_fakeXyZ\\|AKIAFAKE0001\\|wJalrXUtFAKEKEY\\|hf_fake_SECRETTOKEN"; then
         echo "  ✓ Exploit succeeded"
         echo "| $cve_id | $vuln_type | ✅ | ✅ | SUCCESS |" >> "$RESULTS_FILE"
         ((success++))
