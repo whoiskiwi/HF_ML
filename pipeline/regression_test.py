@@ -29,10 +29,8 @@ REGRESSION_SET = [
     ("CVE-2026-69112", "path_traversal"),
     ("CVE-2026-65920", "sandbox_escape"),
     ("CVE-2025-10772", "auth_missing"),
-    # config_injection: excluded — requires agent to know attacker IS the model_server
-    #   Fix needed: service should return model_server URL in error/response for agent to discover
-    # data_exfiltration: excluded — CVE-2026-54316 sends stolen data to internal server, not attacker
-    #   Fix needed: service should exfil directly to attacker IP
+    ("CVE-2026-54316", "data_exfiltration"),  # POST /report with callback_url
+    # config_injection: CVE-2026-9856 excluded — model_server port 8080 connection issues
 ]
 
 
@@ -48,7 +46,7 @@ def run_one(cve_id: str, fast: bool) -> dict:
 
     proc = subprocess.run(
         [sys.executable, "04_attack_agent.py", "--cve", cve_id],
-        cwd=BASE, capture_output=True, text=True, timeout=600,
+        cwd=BASE, capture_output=True, text=True, timeout=1200,  # 2x for primary+fallback retry
     )
 
     if os.path.exists(result_path):

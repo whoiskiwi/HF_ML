@@ -1,8 +1,8 @@
 {
-  "timestamp": "2026-08-25T12:06:20.611500",
+  "timestamp": "2026-08-26T10:38:35.609069",
   "model": "deepseek-ai/DeepSeek-R1",
   "total": 1,
-  "succeeded": 0,
-  "failed": 1,
-  "success_rate": 0.0
+  "succeeded": 1,
+  "failed": 0,
+  "success_rate": 100.0
 }
