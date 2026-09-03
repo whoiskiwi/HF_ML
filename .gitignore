@@ -11,6 +11,14 @@ pipeline/COMMANDS_GUIDE.md
 research_reports/
 hf_ml_attack/agent/plan.md
 
+# Prototype and archived directories (superseded by pipeline)
+hf_ml_attack/
+incident_research_agent/
+archive/
+
+# Unused pipeline scripts
+pipeline/05_batch_test.sh
+
 # Generated pipeline output
 pipeline/output/raw_report.md
 pipeline/output/summary.md
