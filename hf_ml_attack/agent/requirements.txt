@@ -1,3 +1,0 @@
-portkey-ai
-python-dotenv
-requests
