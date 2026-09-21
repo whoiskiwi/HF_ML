@@ -26,6 +26,8 @@ pipeline/output/FAILED_CASES.md
 pipeline/output/test_results.md
 pipeline/output/vulns.json
 pipeline/output/environments/
+pipeline/output/agent_results/
+pipeline/output/checker_data/
 
 # Environment files
 **/.env
